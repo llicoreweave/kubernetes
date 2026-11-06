@@ -99,7 +99,7 @@ type ManagerImpl struct {
 	topologyAffinityStore topologymanager.Store
 
 	// devicesToReuse contains devices that can be reused as they have been allocated to
-	// init containers.
+	// init containers. Access is protected by mutex.
 	devicesToReuse PodReusableDevices
 
 	// containerMap provides a mapping from (pod, container) -> containerID
@@ -367,6 +367,7 @@ func (m *ManagerImpl) Allocate(pod *v1.Pod, container *v1.Container) error {
 	// Use context.TODO() because we currently do not have a proper context to pass in.
 	// Replace this with an appropriate context when refactoring this function to accept a context parameter.
 	ctx := context.TODO()
+	m.mutex.Lock()
 	if _, ok := m.devicesToReuse[string(pod.UID)]; !ok {
 		m.devicesToReuse[string(pod.UID)] = make(map[string]sets.Set[string])
 	}
@@ -376,30 +377,39 @@ func (m *ManagerImpl) Allocate(pod *v1.Pod, container *v1.Container) error {
 			delete(m.devicesToReuse, podUID)
 		}
 	}
+	// Pin this allocation's reuse map before releasing the mutex. Another Pod
+	// may remove its outer entry while the device-plugin RPC is in flight.
+	reusableDevices := m.devicesToReuse[string(pod.UID)]
+	m.mutex.Unlock()
+
 	// Allocate resources for init containers first as we know the caller always loops
 	// through init containers before looping through app containers. Should the caller
 	// ever change those semantics, this logic will need to be amended.
 	for _, initContainer := range pod.Spec.InitContainers {
 		if container.Name == initContainer.Name {
 
-			if err := m.allocateContainerResources(ctx, pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
+			if err := m.allocateContainerResources(ctx, pod, container, reusableDevices); err != nil {
 				return err
 			}
+			m.mutex.Lock()
 			if !podutil.IsRestartableInitContainer(&initContainer) {
-				m.podDevices.addContainerAllocatedResources(string(pod.UID), container.Name, m.devicesToReuse[string(pod.UID)])
+				m.podDevices.addContainerAllocatedResources(string(pod.UID), container.Name, reusableDevices)
 			} else {
 				// If the init container is restartable, we need to keep the
 				// devices allocated. In other words, we should remove them
 				// from the devicesToReuse.
-				m.podDevices.removeContainerAllocatedResources(string(pod.UID), container.Name, m.devicesToReuse[string(pod.UID)])
+				m.podDevices.removeContainerAllocatedResources(string(pod.UID), container.Name, reusableDevices)
 			}
+			m.mutex.Unlock()
 			return nil
 		}
 	}
-	if err := m.allocateContainerResources(ctx, pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
+	if err := m.allocateContainerResources(ctx, pod, container, reusableDevices); err != nil {
 		return err
 	}
-	m.podDevices.removeContainerAllocatedResources(string(pod.UID), container.Name, m.devicesToReuse[string(pod.UID)])
+	m.mutex.Lock()
+	m.podDevices.removeContainerAllocatedResources(string(pod.UID), container.Name, reusableDevices)
+	m.mutex.Unlock()
 	return nil
 }
 
@@ -864,7 +874,10 @@ func (m *ManagerImpl) allocateContainerResources(ctx context.Context, pod *v1.Po
 			m.UpdateAllocatedDevices()
 			allocatedDevicesUpdated = true
 		}
-		allocDevices, err := m.devicesToAllocate(ctx, podUID, contName, resource, needed, devicesToReuse[resource])
+		m.mutex.Lock()
+		reusableDevices := devicesToReuse[resource]
+		m.mutex.Unlock()
+		allocDevices, err := m.devicesToAllocate(ctx, podUID, contName, resource, needed, reusableDevices)
 		if err != nil {
 			return err
 		}
